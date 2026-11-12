@@ -286,8 +286,16 @@ exec env ELECTRON_RUN_AS_NODE=1 "\${ELECTRON_BIN}" "\${DAEMON_CLI}" "$@"
   stripMachOArtifacts(path.join(appOutDir, "resources"));
 
   // Recreate any pnpm symlinks dropped during DMG extraction from the .pnpm
-  // store, in case afterPack runs against a freshly extracted payload.
-  relinkPnpmStore(path.join(appOutDir, "resources", "open-design-web-standalone", "node_modules"));
+  // store, in case afterPack runs against a freshly extracted payload. This
+  // also repairs dangling/absolute scoped links left by older extractors.
+  const webStandaloneNodeModules = path.join(
+    appOutDir,
+    "resources",
+    "open-design-web-standalone",
+    "node_modules",
+  );
+  relinkPnpmStore(webStandaloneNodeModules);
+  assertPortablePnpmLinks(webStandaloneNodeModules);
 };
 
 function stripMachOArtifacts(dir) {
@@ -336,6 +344,91 @@ function relinkPnpmStore(nmDir) {
   const store = path.join(nmDir, ".pnpm", "node_modules");
   if (!fs.existsSync(store)) return;
 
+  const isInside = (base, target) => {
+    const relative = path.relative(base, target);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  };
+
+  const replaceWithStoreLink = (full, rel) => {
+    const storeTarget = path.join(store, rel);
+    if (!fs.existsSync(storeTarget)) return false;
+    const linkTarget = path.relative(path.dirname(full), storeTarget);
+    const stat = fs.lstatSync(full);
+    if (stat.isDirectory() && !stat.isSymbolicLink()) fs.rmdirSync(full);
+    else fs.unlinkSync(full);
+    fs.symlinkSync(linkTarget, full, "dir");
+    console.log(`  relinked ${rel} -> ${linkTarget}`);
+    return true;
+  };
+
+  const relinkIfNeeded = (full, rel) => {
+    let stat;
+    try {
+      stat = fs.lstatSync(full);
+    } catch {
+      return;
+    }
+    if (stat.isSymbolicLink()) {
+      let resolved;
+      try {
+        resolved = path.resolve(path.dirname(full), fs.readlinkSync(full));
+      } catch {
+        return;
+      }
+      // Leave links that stay inside this node_modules tree and resolve.
+      // Repoint broken links and links that escape into a build/install path.
+      if (fs.existsSync(resolved) && isInside(nmDir, resolved)) return;
+      replaceWithStoreLink(full, rel);
+      return;
+    }
+    // 7z replaces symlinks it refuses to write with zero-byte regular files.
+    if (stat.isFile() && stat.size === 0) {
+      replaceWithStoreLink(full, rel);
+    }
+  };
+
+  const visit = (dir, prefix, depth) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name === ".pnpm") continue;
+      const full = path.join(dir, entry.name);
+      const rel = prefix ? path.join(prefix, entry.name) : entry.name;
+      relinkIfNeeded(full, rel);
+      // pnpm stores scoped packages one level deeper: @scope/name.
+      if (depth === 0 && entry.isDirectory() && entry.name.startsWith("@")) {
+        visit(full, rel, depth + 1);
+      }
+    }
+  };
+
+  visit(nmDir, "", 0);
+}
+
+function assertPortablePnpmLinks(nmDir) {
+  if (!nmDir || !fs.existsSync(nmDir)) return;
+  const escapes = [];
+  const check = (full, rel) => {
+    let stat;
+    try {
+      stat = fs.lstatSync(full);
+    } catch {
+      return;
+    }
+    if (!stat.isSymbolicLink()) return;
+    const target = fs.readlinkSync(full);
+    const resolved = path.resolve(path.dirname(full), target);
+    const relative = path.relative(nmDir, resolved);
+    const inside = relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    if (!fs.existsSync(resolved) || !inside) {
+      escapes.push(`${rel} -> ${target}`);
+    }
+  };
+
   let entries;
   try {
     entries = fs.readdirSync(nmDir, { withFileTypes: true });
@@ -345,17 +438,8 @@ function relinkPnpmStore(nmDir) {
   for (const entry of entries) {
     if (entry.name === ".pnpm") continue;
     const full = path.join(nmDir, entry.name);
-    // A dropped symlink shows up as an empty regular file.
-    if (entry.isFile() && fs.statSync(full).size === 0) {
-      const storeTarget = path.join(store, entry.name);
-      if (fs.existsSync(storeTarget)) {
-        fs.rmSync(full, { force: true });
-        fs.symlinkSync(path.relative(path.dirname(full), storeTarget), full);
-      }
-      continue;
-    }
-    if (entry.isDirectory()) {
-      // scoped dir like @next -> check each child for 0-byte drops.
+    check(full, entry.name);
+    if (entry.isDirectory() && entry.name.startsWith("@")) {
       let scoped;
       try {
         scoped = fs.readdirSync(full, { withFileTypes: true });
@@ -363,19 +447,14 @@ function relinkPnpmStore(nmDir) {
         continue;
       }
       for (const child of scoped) {
-        const childFull = path.join(full, child.name);
-        if (child.isFile() && fs.statSync(childFull).size === 0) {
-          const storeTarget =
-            path.join(store, entry.name, child.name);
-          if (fs.existsSync(storeTarget)) {
-            fs.rmSync(childFull, { force: true });
-            fs.symlinkSync(
-              path.relative(path.dirname(childFull), storeTarget),
-              childFull,
-            );
-          }
-        }
+        check(path.join(full, child.name), path.join(entry.name, child.name));
       }
     }
+  }
+
+  if (escapes.length > 0) {
+    throw new Error(
+      `packaged pnpm symlinks resolve outside ${nmDir}:\n${escapes.map((line) => `  ${line}`).join("\n")}`,
+    );
   }
 }

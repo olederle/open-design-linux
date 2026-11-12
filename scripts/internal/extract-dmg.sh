@@ -194,14 +194,13 @@ recreate_pnpm_links() {
   [[ -d "${store}" ]] || return 0
 
   while IFS= read -r -d '' empty; do
-    # Only treat regular empty files as candidates (not directories).
+    # 7z replaces symlinks it refuses to write with empty regular files.
     [[ -f "${empty}" && ! -s "${empty}" ]] || continue
     rel="${empty#${nm}/}"
     target_name="$(basename "${rel}")"
-    # pnpm links live under scoped or flat dirs; resolve against the store root.
-    scope_dir="$(dirname "${rel}")"
     store_target=""
-    # Try same relative path under the store first.
+    # Try the same relative path under the store first (scoped packages), then
+    # the flat package name (unscoped packages).
     if [[ -e "${store}/${rel}" ]]; then
       store_target="${store}/${rel}"
     elif [[ -e "${store}/${target_name}" ]]; then
@@ -209,12 +208,16 @@ recreate_pnpm_links() {
     else
       continue
     fi
+    # Keep the link relative to its own directory. An absolute target would
+    # point at this build machine's app_asar tree and break after packaging;
+    # electron-builder's AppImage step can also rewrite an absolute target
+    # into a relative path that escapes the bundle.
+    link_dir="$(dirname "${empty}")"
+    link_target="$(realpath --relative-to="${link_dir}" "${store_target}")"
     rm -f "${empty}"
-    ln -sf "relative_or_abs_placeholder" "${empty}" 2>/dev/null || true
-    rm -f "${empty}"
-    ln -sf "${store_target}" "${empty}"
-    echo "  relinked ${rel} -> ${store_target}"
-  done < <(find "${nm}" -type f -size 0 ! -name ".*" -print0 2>/dev/null)
+    ln -s "${link_target}" "${empty}"
+    echo "  relinked ${rel} -> ${link_target}"
+  done < <(find "${nm}" -path "${nm}/.pnpm" -prune -o -type f -size 0 ! -name ".*" -print0 2>/dev/null)
 }
 if [[ -d "${APP_ASAR_DIR}/open-design-web-standalone/node_modules" ]]; then
   recreate_pnpm_links "${APP_ASAR_DIR}/open-design-web-standalone/node_modules"
